@@ -7,6 +7,7 @@ authors = ["Our World In Data <tech@worldindata.org>"]
 [tool.poetry.scripts]
 etl = 'etl.command:main'
 reindex = 'etl.reindex:reindex'
+prune = 'etl.prune:prune'
 publish = 'etl.publish:publish'
 harmonize = 'etl.harmonize:harmonize'
 backport = 'backport.backport:backport_cli'

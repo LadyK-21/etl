@@ -68,12 +68,7 @@ def main(
     if grapher:
         sanity_check_db_settings()
 
-    # Load our graph of steps and the things they depend on
-    dag = load_dag(dag_path)
-
-    # Add all steps for backporting datasets (there are currently >800 of them)
-    if backport:
-        dag.update(_backporting_steps())
+    dag = construct_dag(dag_path, backport=backport)
 
     excludes = exclude.split(",") if exclude else []
 
@@ -98,6 +93,19 @@ def sanity_check_db_settings() -> None:
         click.echo("ERROR: No grapher user id has been set in the environment.")
         click.echo("       Did you configure the MySQL connection in .env?")
         sys.exit(1)
+
+
+def construct_dag(dag_path: Path, backport: bool) -> DAG:
+    """Construct full DAG."""
+
+    # Load our graph of steps and the things they depend on
+    dag = load_dag(dag_path)
+
+    # Add all steps for backporting datasets (there are currently >800 of them)
+    if backport:
+        dag.update(_backporting_steps())
+
+    return dag
 
 
 def run_dag(
