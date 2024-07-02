@@ -71,7 +71,7 @@ watch: .venv
 	fi
 	touch .sanity-check
 
-test: check-formatting lint check-typing unittest version-tracker
+test: check-formatting check-linting check-typing unittest version-tracker
 
 .venv: .sanity-check pyproject.toml poetry.toml poetry.lock
 	@echo '==> Installing packages'
@@ -153,10 +153,6 @@ api: .venv
 fasttrack: .venv
 	@echo '==> Starting Fast-track on http://localhost:8082/'
 	poetry run fasttrack --skip-auto-open --port 8082
-
-chart-sync: .venv
-	@echo '==> Starting Chart-sync on http://localhost:8083/'
-	poetry run streamlit run apps/chart_sync/app.py --server.port 8083
 
 wizard: .venv
 	@echo '==> Starting Wizard on http://localhost:8053/'

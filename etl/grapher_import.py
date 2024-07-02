@@ -10,7 +10,9 @@ Usage:
 """
 
 import datetime
+import json
 import os
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Lock
@@ -24,12 +26,8 @@ from sqlalchemy import select, text, update
 from sqlalchemy.engine.base import Engine
 from sqlalchemy.orm import Session
 
-from apps.backport.datasync.data_metadata import (
-    add_entity_code_and_name,
-    variable_data,
-    variable_metadata,
-)
-from apps.backport.datasync.datasync import upload_gzip_dict
+from apps.backport.datasync import data_metadata as dm
+from apps.backport.datasync.datasync import upload_gzip_string
 from etl import config
 from etl.db import get_engine
 
@@ -203,6 +201,10 @@ def upsert_table(
     of the variable is used to fill the required fields.
     """
 
+    # We sometimes get a warning, but it's unclear where it is coming from
+    # Passing a BlockManager to Table is deprecated and will raise in a future version. Use public APIs instead.
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
+
     assert set(table.index.names) == {"year", "entity_id"}, (
         "Tables to be upserted must have only 2 indices: year and entity_id. Instead" f" they have: {table.index.names}"
     )
@@ -260,6 +262,9 @@ def upsert_table(
                 max_year = max(years)
                 timespan = f"{min_year}-{max_year}"
 
+        # sort table to get deterministic checksum later on
+        table = table.sort_index()
+
         table.reset_index(inplace=True)
 
         source_id = _add_or_update_source(session, variable_meta, column_name, dataset_upsert_result)
@@ -292,7 +297,7 @@ def upsert_table(
 
         # NOTE: we could prefetch all entities in advance, but it's not a bottleneck as it takes
         # less than 10ms per variable
-        df = add_entity_code_and_name(session, df)
+        df = dm.add_entity_code_and_name(session, df)
 
         # update links, we need to do it after we commit deleted relationships above
         db_variable.update_links(
@@ -308,20 +313,41 @@ def upsert_table(
         session.commit()
 
         # process data and metadata
-        var_data = variable_data(df)
-        var_metadata = variable_metadata(session, db_variable_id, df)
+        var_data = dm.variable_data(df)
+        var_metadata = dm.variable_metadata(session, db_variable_id, df)
+
+        var_data_str = json.dumps(var_data, default=str)
+        var_metadata_str = json.dumps(var_metadata, default=str)
+
+        checksum_data = dm.checksum_data_str(var_data_str)
+        # NOTE: _checksum_metadata modifies `var_metadata` object, but we have it as a string already
+        checksum_metadata = dm.checksum_metadata(var_metadata)
 
         # upload them to R2
         with ThreadPoolExecutor() as executor:
-            futures = [
-                executor.submit(upload_gzip_dict, var_data, db_variable.s3_data_path()),
-                executor.submit(upload_gzip_dict, var_metadata, db_variable.s3_metadata_path()),
-            ]
-            # Wait for futures to complete in case exceptions are raised
-            [f.result() for f in futures]
+            futures = []
+
+            if db_variable.dataChecksum != checksum_data:
+                db_variable.dataChecksum = checksum_data
+                futures.append(executor.submit(upload_gzip_string, var_data_str, db_variable.s3_data_path()))
+
+            if db_variable.metadataChecksum != checksum_metadata:
+                db_variable.metadataChecksum = checksum_metadata
+                futures.append(executor.submit(upload_gzip_string, var_metadata_str, db_variable.s3_metadata_path()))
+
+            # commit new checksums
+            if futures:
+                # Wait for futures to complete in case exceptions are raised
+                [f.result() for f in futures]
+
+                session.add(db_variable)
+                session.commit()
 
         if verbose:
-            log.info("upsert_table.uploaded_to_s3", size=len(table), variable_id=db_variable_id)
+            if futures:
+                log.info("upsert_table.uploaded_to_s3", size=len(table), variable_id=db_variable_id)
+            else:
+                log.info("upsert_table.skipped_upload_to_s3", size=len(table), variable_id=db_variable_id)
 
         return VariableUpsertResult(db_variable_id, source_id)  # type: ignore
 
@@ -360,7 +386,7 @@ def set_dataset_checksum_and_editedAt(dataset_id: int, checksum: str) -> None:
         session.commit()
 
 
-def cleanup_ghost_variables(engine: Engine, dataset_id: int, upserted_variable_ids: List[int]) -> None:
+def cleanup_ghost_variables(engine: Engine, dataset_id: int, upserted_variable_ids: List[int]) -> bool:
     """Remove all leftover variables that didn't get upserted into DB during grapher step.
     This could happen when you rename or delete a variable in ETL.
     Raise an error if we try to delete variable used by any chart.
@@ -368,6 +394,8 @@ def cleanup_ghost_variables(engine: Engine, dataset_id: int, upserted_variable_i
     :param dataset_id: ID of the dataset
     :param upserted_variable_ids: variables upserted in grapher step
     :param workers: delete variables in parallel
+
+    :return: True if successful
     """
     with engine.connect() as con:
         # get all those variables first
@@ -384,7 +412,7 @@ def cleanup_ghost_variables(engine: Engine, dataset_id: int, upserted_variable_i
 
         # nothing to delete, quit
         if not variable_ids_to_delete:
-            return
+            return True
 
         log.info("cleanup_ghost_variables.start", size=len(variable_ids_to_delete))
 
@@ -399,7 +427,14 @@ def cleanup_ghost_variables(engine: Engine, dataset_id: int, upserted_variable_i
         ).fetchall()
         if rows:
             rows = pd.DataFrame(rows, columns=["chartId", "variableId"])
-            raise ValueError(f"Variables used in charts will not be deleted automatically:\n{rows}")
+
+            # show a warning
+            log.warning(
+                "Variables used in charts will not be deleted automatically",
+                rows=rows,
+                variables=variable_ids_to_delete,
+            )
+            return False
 
         # then variables themselves with related data in other tables
         con.execute(
@@ -457,11 +492,15 @@ def cleanup_ghost_variables(engine: Engine, dataset_id: int, upserted_variable_i
             {"dataset_id": dataset_id, "variable_ids": variable_ids_to_delete},
         )
 
+        con.commit()
+
         log.warning(
             "cleanup_ghost_variables.end",
             size=result.rowcount,
             variables=variable_ids_to_delete,
         )
+
+        return True
 
 
 def cleanup_ghost_sources(engine: Engine, dataset_id: int, upserted_source_ids: List[int]) -> None:
@@ -482,6 +521,7 @@ def cleanup_ghost_sources(engine: Engine, dataset_id: int, upserted_source_ids: 
                 {"dataset_id": dataset_id},
             )
         if result.rowcount > 0:
+            con.commit()
             log.warning(f"Deleted {result.rowcount} ghost sources")
 
 
