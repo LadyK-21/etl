@@ -55,7 +55,14 @@ def test_single_table_dataset_flattens_table_metadata() -> None:
     assert jsonld["publisher"]["logo"] == "https://ourworldindata.org/owid-logo.svg"
     assert jsonld["temporalCoverage"] == "1812/2023"
     assert jsonld["spatialCoverage"] == "Worldwide"
-    assert jsonld["creator"] == {"@type": "Organization", "name": "Example Producer"}
+    assert jsonld["creator"] == {
+        "@type": "Organization",
+        "name": "Our World in Data",
+        "url": "https://ourworldindata.org",
+    }
+    # The origin has no DOI in its citation, so no related-article citation is emitted;
+    # the producer is still credited via isBasedOn below.
+    assert "citation" not in jsonld
     assert jsonld["isBasedOn"]["url"] == "https://example.com/source"
     assert jsonld["keywords"] == ["Biodiversity"]
     assert jsonld["variableMeasured"][0]["identifier"] == "full_flowering_date"
@@ -322,3 +329,152 @@ def test_license_to_url_resolves_known_license_names() -> None:
     assert license_to_url(License(name="CC BY 4.0")) == "https://creativecommons.org/licenses/by/4.0/"
     assert license_to_url(License(name=" CC-BY 4.0 ")) == "https://creativecommons.org/licenses/by/4.0/"
     assert license_to_url(License(name="Custom license")) is None
+
+
+def test_templated_variable_metadata_is_never_emitted_raw() -> None:
+    meta = VariableMeta(
+        title='<% if poverty_line == "215" %>Below $2.15<% else %>Below the line<% endif %>',
+        description_short="The share of population below <<poverty_line>> a day.",
+        unit="international-$ in <<ppp_version>> prices",
+    )
+    table = TableSchemaInput(
+        short_name="poverty",
+        metadata=TableMeta(short_name="poverty", title="Poverty", description="Table description"),
+        variables={"headcount_ratio": meta},
+        formats=["feather"],
+    )
+    jsonld = dataset_to_schema_org(
+        dataset_path="garden/wb/2025-01-01/pip",
+        page_path="wb/pip",
+        dataset_meta=DatasetMeta(short_name="pip", title="PIP", description="Dataset description"),
+        tables=[table],
+    )
+    (variable,) = jsonld["variableMeasured"]
+    # Without representative dimension values nothing can be rendered: fall back to the
+    # identifier and omit the templated fields entirely.
+    assert variable["name"] == "headcount_ratio"
+    assert "description" not in variable
+    assert "unitText" not in variable
+    serialized = str(jsonld)
+    assert "<%" not in serialized and "<<" not in serialized
+
+
+def test_templated_description_renders_example_using_representative_dimensions() -> None:
+    meta = VariableMeta(
+        title="Poverty headcount",
+        description_short='People below <% if poverty_line == "215" %>$2.15<% else %>the line<% endif %> a day.',
+        unit="people in <<ppp_version>> prices",
+    )
+    table = TableSchemaInput(
+        short_name="poverty",
+        metadata=TableMeta(
+            short_name="poverty",
+            title="Poverty",
+            description="Table description",
+            dimensions=[
+                {"name": "country", "slug": "country"},
+                {"name": "year", "slug": "year"},
+                {"name": "Poverty line", "slug": "poverty_line"},
+            ],
+        ),
+        variables={"headcount": meta},
+        formats=["feather"],
+        primary_key=["country", "year", "poverty_line"],
+        dimension_values={"poverty_line": ["215", "365"]},
+        representative_dimensions={"poverty_line": "215"},
+    )
+    jsonld = dataset_to_schema_org(
+        dataset_path="garden/wb/2025-01-01/pip",
+        page_path="wb/pip",
+        dataset_meta=DatasetMeta(short_name="pip", title="PIP", description="Dataset description"),
+        tables=[table],
+    )
+    variables = {variable["identifier"]: variable for variable in jsonld["variableMeasured"]}
+    # country/year are conveyed by temporal/spatialCoverage, not emitted as dimensions.
+    assert set(variables) == {"poverty_line", "headcount"}
+    assert variables["poverty_line"]["name"] == "Poverty line"
+    assert "Values: 215, 365." in variables["poverty_line"]["description"]
+    assert variables["headcount"]["description"] == (
+        "For example, for poverty_line=215: People below $2.15 a day. Varies by the dimension columns: poverty_line."
+    )
+    # A templated unit is only correct for one slice of the column: omitted.
+    assert "unitText" not in variables["headcount"]
+
+
+def test_plain_description_strips_detail_on_demand_links() -> None:
+    meta = VariableMeta(title="Consumption", description_short="Measured in [terawatt-hours](#dod:watt-hours).")
+    table = TableSchemaInput(
+        short_name="energy",
+        metadata=TableMeta(short_name="energy", title="Energy", description="Table description"),
+        variables={"consumption": meta},
+        formats=["feather"],
+    )
+    jsonld = dataset_to_schema_org(
+        dataset_path="garden/energy/2025-01-01/energy",
+        page_path="energy/energy",
+        dataset_meta=DatasetMeta(short_name="energy", title="Energy", description="Dataset description"),
+        tables=[table],
+    )
+    (variable,) = jsonld["variableMeasured"]
+    # Detail-on-demand links only resolve on ourworldindata.org; keep just the link text.
+    assert variable["description"] == "Measured in terawatt-hours."
+
+
+def test_citation_extracts_dois_and_leads_with_most_used_origin() -> None:
+    main_origin = Origin(
+        producer="Global Carbon Project",
+        attribution="Global Carbon Budget (2025)",
+        title="Global Carbon Budget",
+        citation_full=(
+            "Friedlingstein, P. et al.: Global Carbon Budget 2024, Earth Syst. Sci. Data, "
+            "https://doi.org/10.5194/essd-17-965-2025, 2025."
+        ),
+        url_main="https://globalcarbonbudget.org",
+    )
+    helper_origin = Origin(
+        producer="Various sources",
+        attribution="Population based on various sources (2024)",
+        title="Population",
+        # No DOI: helper source stays out of citation, but keeps its isBasedOn entry.
+        citation_full="Population is based on various sources: https://ourworldindata.org/population-sources",
+        url_main="https://example.com/population",
+    )
+    doi_prefix_origin = Origin(
+        producer="Bolt and van Zanden",
+        title="Maddison Project Database",
+        date_published="2024-04-26",
+        # "DOI: <id>" form (no doi.org URL) must be recognized too.
+        citation_full='Bolt and van Zanden (2024), "Maddison style estimates". DOI: 10.1111/joes.12618.',
+        url_main="https://example.com/maddison",
+    )
+    # The helper origin backs the *first* column; the main origin backs the remaining
+    # columns. Citation must still lead with the main origin, not follow column order.
+    variables = {"population": VariableMeta(title="Population", origins=[helper_origin])}
+    for name in ("co2", "co2_per_capita"):
+        variables[name] = VariableMeta(title=name, origins=[main_origin])
+    variables["gdp"] = VariableMeta(title="gdp", origins=[doi_prefix_origin])
+    table = TableSchemaInput(
+        short_name="owid_co2",
+        metadata=TableMeta(short_name="owid_co2", title="CO2", description="Table description"),
+        variables=variables,
+        formats=["feather"],
+    )
+    jsonld = dataset_to_schema_org(
+        dataset_path="garden/emissions/2025-12-04/owid_co2",
+        page_path="emissions/owid_co2",
+        dataset_meta=DatasetMeta(short_name="owid_co2", title="CO2 dataset", description="Dataset description"),
+        tables=[table],
+    )
+    # Creator is the author of this compiled artifact; producers keep credit in isBasedOn.
+    assert jsonld["creator"] == {
+        "@type": "Organization",
+        "name": "Our World in Data",
+        "url": "https://ourworldindata.org",
+    }
+    assert jsonld["citation"] == [
+        "Global Carbon Budget (2025). https://doi.org/10.5194/essd-17-965-2025",
+        # Attribution missing: fall back to producer (year of date_published).
+        "Bolt and van Zanden (2024). https://doi.org/10.1111/joes.12618",
+    ]
+    assert jsonld["isBasedOn"][0]["url"] == "https://globalcarbonbudget.org"
+    assert {item["url"] for item in jsonld["isBasedOn"]} >= {"https://example.com/population"}
