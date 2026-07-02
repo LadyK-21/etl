@@ -37,6 +37,7 @@ def test_single_table_dataset_flattens_table_metadata() -> None:
             version="2025-04-07",
             short_name="cherry_blossom",
             title="Cherry Blossom Full Bloom Dates in Kyoto, Japan",
+            description="Cherry blossom bloom dates in Kyoto.",
         ),
         tables=[table],
     )
@@ -89,6 +90,7 @@ def test_version_param_overrides_latest_dataset_meta_version() -> None:
             version="latest",
             short_name="owid_co2",
             title="CO2 emissions",
+            description="CO2 emissions dataset.",
         ),
         tables=[table],
     )
@@ -115,6 +117,7 @@ def test_version_falls_back_to_dataset_meta_version_when_not_given() -> None:
             version="2025-04-07",
             short_name="cherry_blossom",
             title="Cherry blossom",
+            description="Cherry blossom bloom dates in Kyoto.",
         ),
         tables=[table],
     )
@@ -136,7 +139,9 @@ def test_distribution_content_urls_use_dated_path_not_short_page_path() -> None:
     jsonld = dataset_to_schema_org(
         dataset_path="garden/emissions/2025-12-04/owid_co2",
         page_path="emissions/owid_co2",
-        dataset_meta=DatasetMeta(namespace="emissions", version="2025-12-04", short_name="owid_co2"),
+        dataset_meta=DatasetMeta(
+            namespace="emissions", version="2025-12-04", short_name="owid_co2", description="CO2 emissions dataset."
+        ),
         tables=[table],
     )
 
@@ -235,7 +240,7 @@ def test_table_description_falls_back_to_origin_then_dataset() -> None:
     assert parts["no_origin_desc"]["description"] == "Dataset-level description"
 
 
-def test_table_description_helper_prefers_explicit_and_returns_none_without_any_source() -> None:
+def test_table_description_ignores_internal_table_metadata_description() -> None:
     origin_without_desc = Origin(producer="Producer", title="Original")
     table = TableSchemaInput(
         short_name="t",
@@ -243,11 +248,74 @@ def test_table_description_helper_prefers_explicit_and_returns_none_without_any_
         variables={"value": VariableMeta(title="Value", origins=[origin_without_desc])},
         formats=["feather"],
     )
-    # No table/origin/dataset description available anywhere -> None (nothing is synthesized).
+    # No origin/dataset description available anywhere -> None (nothing is synthesized).
     assert table_description(table, DatasetMeta(short_name="d")) is None
-    # An explicit table description wins over origin and dataset descriptions.
-    table.metadata.description = "Explicit table description"
-    assert table_description(table, DatasetMeta(short_name="d", description="ds")) == "Explicit table description"
+    # TableMeta.description is a mostly-internal field and must never leak into JSON-LD, even
+    # when explicitly set: it neither wins over an available dataset description...
+    table.metadata.description = "Internal table description"
+    assert table_description(table, DatasetMeta(short_name="d", description="ds")) == "ds"
+    # ...nor gets used as a last resort when nothing else is available.
+    assert table_description(table, DatasetMeta(short_name="d")) is None
+
+
+def test_dataset_description_raises_without_explicit_description() -> None:
+    """Regression guard: a dataset with no dataset- or table-level description must fail loudly
+    rather than silently borrow a description from one of its indicators' origins. Previously, a
+    dataset combining many indicators from its own primary source with a borrowed auxiliary
+    indicator (e.g. population, added for per-capita columns) would describe itself using
+    whichever origin happened to be attached to the first column defined in the table — here,
+    population's origin — even though population has nothing to do with the dataset's actual
+    subject matter."""
+    population_origin = Origin(producer="Our World in Data", title="Population", description="Population blurb.")
+    energy_origin = Origin(producer="Energy Institute", title="Statistical Review", description="Energy blurb.")
+    table = TableSchemaInput(
+        short_name="owid_energy",
+        metadata=TableMeta(short_name="owid_energy", title="Energy"),
+        variables={
+            "population": VariableMeta(title="Population", origins=[population_origin]),
+            "coal_consumption": VariableMeta(title="Coal consumption", origins=[energy_origin]),
+        },
+        formats=["feather"],
+    )
+
+    try:
+        dataset_to_schema_org(
+            dataset_path="garden/energy_data/2026-04-24/owid_energy",
+            page_path="energy_data/owid_energy",
+            dataset_meta=DatasetMeta(namespace="energy_data", version="2026-04-24", short_name="owid_energy"),
+            tables=[table],
+        )
+        raise AssertionError("Expected dataset_to_schema_org to raise ValueError for a missing description.")
+    except ValueError as error:
+        assert "owid_energy" in str(error)
+
+
+def test_dataset_description_ignores_table_level_description() -> None:
+    """A table's own ``description`` (a mostly-internal field) must never substitute for a real
+    ``dataset.description`` — only an explicit dataset-level description satisfies the
+    requirement, even for a single-table dataset."""
+    table = TableSchemaInput(
+        short_name="owid_energy",
+        metadata=TableMeta(short_name="owid_energy", title="Energy", description="Internal table description."),
+        variables={
+            "population": VariableMeta(
+                title="Population",
+                origins=[Origin(producer="Our World in Data", title="Population", description="Population blurb.")],
+            )
+        },
+        formats=["feather"],
+    )
+
+    try:
+        dataset_to_schema_org(
+            dataset_path="garden/energy_data/2026-04-24/owid_energy",
+            page_path="energy_data/owid_energy",
+            dataset_meta=DatasetMeta(namespace="energy_data", version="2026-04-24", short_name="owid_energy"),
+            tables=[table],
+        )
+        raise AssertionError("Expected dataset_to_schema_org to raise ValueError for a missing description.")
+    except ValueError as error:
+        assert "owid_energy" in str(error)
 
 
 def test_license_to_url_resolves_known_license_names() -> None:
