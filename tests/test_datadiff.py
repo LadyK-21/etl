@@ -219,14 +219,38 @@ def test_coverage_loss_forces_large_tier():
     assert 'class="chip tier large">🔴 median anomaly score' in html
 
 
-def test_triage_aids_only_on_big_reports():
-    small = DiffReport(datasets=[_changed_ds("garden/n/v/a", 0.5)])
-    html_small = render_html(small)
-    # A single changed dataset: no watch list, no tier strip — but the row chip still renders.
+def test_triage_aids_gate_on_content():
+    # Each triage element renders only when it can discriminate.
     # (Assert on rendered elements, not bare class names — those always appear in the stylesheet.)
-    assert "Top changes" not in html_small
-    assert '<div class="tier-strip">' not in html_small
-    assert "anomaly score" in html_small
+
+    # One dataset, ONE indicator: nothing to rank — no watch list, no tier strip; chips only.
+    tiny = DiffReport(datasets=[_changed_ds("garden/n/v/a", 0.5)])
+    html_tiny = render_html(tiny)
+    assert "Top changes" not in html_tiny
+    assert '<div class="tier-strip">' not in html_tiny
+    assert "anomaly score" in html_tiny
+
+    # One dataset, MANY indicators: the Indicators list ranks them (that's where it helps most),
+    # but the singleton Datasets sub-list and the "Of the 1 dataset" strip stay hidden.
+    many_cols = DiffReport(
+        datasets=[
+            DatasetDiffResult(
+                path="garden/n/v/wide",
+                kind="identical",
+                tables=[
+                    TableDiffResult(
+                        name="t",
+                        kind="identical",
+                        columns=[_changed_col(f"c{i}", 0.5 - i * 0.1) for i in range(4)],
+                    )
+                ],
+            )
+        ]
+    )
+    html_many = render_html(many_cols)
+    assert ">Indicators<" in html_many
+    assert ">Datasets<" not in html_many
+    assert '<div class="tier-strip">' not in html_many
 
     big = DiffReport(datasets=[_changed_ds(f"garden/n/v/d{i}", 0.5 - i * 0.1) for i in range(4)])
     html_big = render_html(big)
@@ -293,7 +317,7 @@ def test_top_changes_show_more():
 
 def test_headline_counts_datasets():
     one = DiffReport(datasets=[_changed_ds("garden/n/v/a", 0.5)])
-    assert "❌ Found differences in 1 of 1 compared dataset" in render_html(one)
+    assert "❌ Found differences in the compared dataset" in render_html(one)
 
     mixed = DiffReport(
         datasets=[
@@ -304,7 +328,10 @@ def test_headline_counts_datasets():
     assert "❌ Found differences in 1 of 2 compared datasets" in render_html(mixed)
 
     clean = DiffReport(datasets=[DatasetDiffResult(path="garden/n/v/b", kind="identical")])
-    assert "✅ No differences found across 1 compared dataset" in render_html(clean)
+    assert "✅ No differences found in the compared dataset" in render_html(clean)
+
+    all_changed = DiffReport(datasets=[_changed_ds(f"garden/n/v/d{i}", 0.5) for i in range(3)])
+    assert "❌ Found differences in all 3 compared datasets" in render_html(all_changed)
 
 
 def test_top_changes_lists_data_losses_first():
