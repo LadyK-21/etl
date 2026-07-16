@@ -9,12 +9,12 @@ meta:
     attribution_short: CPUC
     url_main: |-
       https://www.cpuc.ca.gov/regulatory-services/licensing/transportation-licensing-and-analysis-branch/autonomous-vehicle-programs/quarterly-reporting
-    date_accessed: '2026-03-30'
-    date_published: '2026-02-02'
+    date_accessed: '2026-07-15'
+    date_published: '2026-05-11'
     license:
       name: Public domain
       url: https://www.cpuc.ca.gov/about-cpuc/conditions-of-use
 outs:
-  - md5: 1fea159ce14fc59b29c0ec90c7a0e9f1
-    size: 16070
+  - md5: 52c05e77378f483e963802c7f518d26a
+    size: 16883
     path: robotaxis.csv
