@@ -59,7 +59,6 @@ def run() -> None:
     ds_meadow = paths.load_dataset()
     ds_population = paths.load_dataset("population")
     ds_regions = paths.load_dataset("regions")
-    ds_income_groups = paths.load_dataset("income_groups")
     ds_population_wpp = paths.load_dataset("un_wpp")
 
     #
@@ -75,7 +74,11 @@ def run() -> None:
 
     tb_cust = mk_custom_entities(tb)
     assert all([col in tb.columns for col in tb_cust.columns])
-    tb = pd.concat([tb, tb_cust], axis=0).copy_metadata(tb)  # ty: ignore
+    tb = (
+        pr.concat([tb.reset_index(), Table(tb_cust).reset_index()], axis=0)
+        .copy_metadata(tb)
+        .format(["country", "year"])
+    )
 
     tb_garden = tb
 
@@ -98,7 +101,7 @@ def run() -> None:
     tb_garden = add_armed_personnel_as_share_of_population(tb_garden)
 
     # add regions to remittance data
-    tb_garden = add_regions_to_remittance_data(tb_garden, ds_regions, ds_income_groups)
+    tb_garden = add_regions_to_remittance_data(tb_garden)
 
     # Adjust GDP indicators in current US$ to constant US$ using the growth of the same indicator in LCU
     for gdp_current_usd, gdp_constant_lcu in GDP_INDICATORS.items():
@@ -149,7 +152,7 @@ def run() -> None:
     log.info("wdi.end")
 
 
-def add_regions_to_remittance_data(tb: Table, ds_regions: Dataset, ds_income_groups: Dataset) -> Table:
+def add_regions_to_remittance_data(tb: Table) -> Table:
     """
     Add regions to remittance data, if more than 75% of remittance volume sent/ received is covered by cost data.
 
@@ -198,10 +201,8 @@ def add_regions_to_remittance_data(tb: Table, ds_regions: Dataset, ds_income_gro
     regions_tb = regions_tb[cols_for_aggregation]
 
     # add regions to table
-    regions_tb = geo.add_regions_to_table(
+    regions_tb = paths.regions.add_aggregates(
         regions_tb,
-        ds_regions=ds_regions,
-        ds_income_groups=ds_income_groups,
         aggregations=agg,
         min_num_values_per_year=1,
     )
@@ -246,7 +247,7 @@ def add_regions_to_remittance_data(tb: Table, ds_regions: Dataset, ds_income_gro
 
 def mk_omms(table: Table) -> Table:
     """calculates custom variables (aka "owid-maintained metrics")"""
-    df = pd.DataFrame(table)
+    df = table
     orig_df_shape = df.shape[0]
     omms = []
     tb_omm = Table()
@@ -781,6 +782,9 @@ def add_population_weighted_aggregations(tb: Table, indicator: str, ds_regions: 
     tb[f"{indicator}_weighted"] = tb[indicator] * tb["population"]
 
     # Add regional aggregates for these indicators
+    # NOTE: kept on geo.add_regions_to_table -- an A/B test against paths.regions.add_aggregates
+    # showed a material difference in the "World" aggregate for this population-weighted sum
+    # (not a tiny edge case), so the two are not equivalent here. Investigate before switching.
     tb_regions = geo.add_regions_to_table(
         tb=tb,
         aggregations={
