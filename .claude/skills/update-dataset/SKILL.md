@@ -37,13 +37,14 @@ Assumptions:
 - [ ] Update snapshot and compare to previous version; capture summary
 - [ ] Meadow step: run + fix + diff + summarize
 - [ ] Garden step: run + fix + diff + summarize
+- [ ] Surface new indicators: check meadow + garden diffs (and snapshot columns when meadow hardcodes a column subset) for new-version columns absent from the old; warn user + PR body, flag new-but-dropped columns, route rename pairs to the step-7 mapping
 - [ ] Review `sanity_checks` output (enable log flag, re-run, scan log, revert flag) — if none found and the garden step does non-trivial logic, recommend adding them; if present but missing value bounds (positive / [0,1] / [0,100] per indicator type), suggest those too (see 5b-bis)
 - [ ] Country harmonization audit: validate `.countries.json` against canonical regions (flag provider regions not yet in the regions dataset → `/add-provider-regions`), audit `.excluded_countries.json`, scan garden log for missing/unused/unknown warnings
 - [ ] Region-provider drift: if this dataset's aggregates are in `regions.yml` (`defined_by: <provider>`), check whether the new version changed the provider's region set or country membership; if so, update `regions.yml` and re-propagate via `/add-provider-regions`
 - [ ] Grapher step: run + verify (skip diffs), or explicitly mark N/A
 - [ ] Re-evaluate each catalogued `# NOTE:` / `# TODO:` against fresh data; delete resolved workarounds + comments together, or record status in PR body
 - [ ] Check metadata: typos, Jinja spacing, style guide compliance
-- [ ] Verify indicator-metadata coverage, `dataset.update_period_days`, snapshot DVC `date_published` and `citation_full` year (`etl update` copies both verbatim — bump to the producer's real release date / year, or to `date_accessed` / current year if the source doesn't publish one), and that all URLs resolve (HEAD-check)
+- [ ] Verify indicator-metadata coverage, `dataset.update_period_days`, snapshot DVC `date_published` and `citation_full` year (`etl update` copies both verbatim — bump to the producer's real release date / year, or to `date_accessed` / current year if the source doesn't publish one), and that all URLs resolve (HEAD-check) and every `#fragment` matches a real anchor in the target page (anchor pass, see 6c)
 - [ ] Scheduled-issue workflow check (owid-issues): locate the dataset's `update-*.yml` (exact / fuzzy / group match), verify cron vs the observed release cadence + `update_period_days`, filename convention, and that the issue body says to run `/update-dataset <short_name>`; auto-fix body/title, ask before cron changes or new workflows — commits go straight to owid-issues main (see 6d)
 - [ ] Commit, push, and update PR description
 - [ ] Run indicator upgrade on staging and persist report
@@ -192,6 +193,15 @@ For the **long-format with dimensions** sub-case specifically (e.g. one row per 
    The apples-to-apples diff should collapse to just your intended change. Mention the drift separately in the PR (Chart Diff on staging *will* show it, because the live data is also stale relative to current upstream). This bit me twice in one update — don't skip it.
 
    **When NaN can appear on one side, don't let `.fillna(False)` hide it.** In a cell-by-cell diff, `(a - b).abs() <= tol` evaluates to `NaN` when exactly one side is NaN; a downstream `.fillna(False)` then silently drops that real one-sided change. Treat "one side NaN, other side not" as a difference explicitly.
+
+   **Surface new indicators.** Collect columns present in the new version but absent from the old — read **both the meadow diff (step 4) and the garden diff**, because the pipeline may drop columns between the two. `etl diff` prints additions as green `+ Column` lines, but the ranked HTML report scores them at severity 0 — they sort last and will not surface on their own; read the text/JSON output, or compare column sets directly (`set(ds_new[t].columns) - set(ds_old[t].columns)` per table). Classify each find:
+   - **New in meadow and in garden** → genuinely new indicator: warn the user and list it in the PR body under a "New indicators" heading — it appears on no chart until someone curates it, needs the same metadata coverage as the rest (see 6c), and may deserve a mention in the update announcement (step 9).
+   - **New in meadow but missing from garden** → the pipeline drops it (explicit column selection or `.drop(columns=...)` in garden): surface it as "the source now ships X — currently dropped" and let the user decide deliberately whether to keep it.
+   - **Paired `+ Column` / `− Column`** → usually a **rename**, not an addition — route it to the indicator-upgrade mapping (step 7) instead.
+
+   **Long-format tables hide additions from the column diff.** When a table keys its series by a dimension column (`indicator`, `metric`, `question`, …) with a stable `value` column, a new series adds *rows*, not columns — the column-set diff stays empty. Also diff the distinct **combinations** of the identifying dimensions, not each dimension's values separately — a new series can be a new tuple of existing values (e.g. `sex=male` and `metric=count` both existed before, but the `(male, count)` series is new): `set(tb_new.reset_index()[dims].itertuples(index=False, name=None)) - set(tb_old.reset_index()[dims].itertuples(index=False, name=None))` where `dims` is the list of identifying dimension columns — built tables keep them in the index after `Table.format(...)`, hence the `reset_index()` (with a single dimension this reduces to a value-set diff). The grapher step expands dimension values into separate variables, so the step-7 shortName pairing surfaces these too — but catch them here, before staging.
+
+   If the **meadow step itself selects a hardcoded column subset** (`tb[[...]]`, `usecols=`, `.drop(columns=...)`), a new source column never reaches any diff — grep the meadow step for such selections and, when present, compare the raw **snapshot** column set old-vs-new (`snap.read_*().columns`) to catch additions dropped at the door.
 
 5b) Review sanity-checks output (only if step 1d catalogued any)
    Handling depends on the form catalogued in step 1d.
@@ -490,6 +500,24 @@ For the **long-format with dimensions** sub-case specifically (e.g. one row per 
 
    Fix any genuinely-non-2xx hit on `url_main`, `url_download`, `license.url`, or URLs referenced from `description` / `description_key` before continuing. The `sed` strips trailing markdown/punctuation chars (`)`, `.`, `,`, `;`, `:`, `>`) so URLs inside `[text](url)` aren't reported as broken because of a stray closing paren.
 
+   **Anchor fragments — HTTP 200 can't validate them.** Servers ignore everything after `#`, so `https://ourworldindata.org/poverty#key-insightsfdd` (broken anchor) returns the same 200 as the real `#key-insights`. For every checked URL that carries a fragment, run a second pass against the page *body*:
+   ```bash
+   for url in $(rg --no-filename -No "https?://[^\"' ]+" snapshots/<namespace>/<new_version>/ etl/steps/data/{meadow,garden,grapher}/<namespace>/<new_version>/ \
+       | sed -E 's/[).,;:>]+$//' | sort -u | rg '#'); do
+       page="${url%%#*}"; frag="${url#*#}"
+       case "$frag" in *=*|*/*|'!'*) continue;; esac  # non-DOM fragments — see below
+       # grep -F: fragments may contain regex metacharacters (#section.2) — ERE would false-OK id="section-2"
+       if curl -sL --max-time 20 -A 'Mozilla/5.0' "$page" | grep -qF -e "id=\"$frag\"" -e "id='$frag'" -e "name=\"$frag\"" -e "name='$frag'"; then
+           printf "OK         %s\n" "$url"
+       else
+           printf "NO-ANCHOR  %s\n" "$url"
+       fi
+   done
+   ```
+   - **Skip non-DOM fragments** (the `case` list): anything containing `=` (scroll-to-text `#:~:text=`, Google Sheets `#gid=…`, PDF `#page=…`) or `/` (hash-route state, whether slash-prefixed `#/dashboard` or not — e.g. FAOSTAT's `#data/FBS`), plus `#!…` hashbangs — none correspond to an element `id` and all would false-alarm. Real anchors are heading slugs and never contain `=` or `/`.
+   - **`NO-ANCHOR` is a signal, not proof** — same epistemics as the curl false-404 note above. Two false-positive modes: the page renders its anchors client-side (the raw HTML lacks the `id`), or curl got a Cloudflare challenge page instead of the real body. Confirm before flagging: check the fetched body is the real page (grep for `</html>` and a plausible `<title>`), then ask `WebFetch` whether the page has a section/heading matching the de-slugged fragment (`key-insights` → "Key insights") — OWID heading anchors are slugged headings, so heading-text presence is the authoritative check.
+   - **On a confirmed missing anchor** the reader still lands on the right page, just at the top — fix the fragment (grep the body's `id="` values for the nearest real anchor) or drop it. Apply the same restraint as above: **flag and ask before rewriting** — the section may exist under a different slug, or the page may not have rebuilt yet.
+
    **Verification.** After editing, re-run the affected step (with `--grapher` if grapher) so the catalog reflects the changes. Then confirm `presentation.attribution_short` actually landed:
    ```python
    from owid.catalog import Dataset
@@ -547,7 +575,7 @@ For the **long-format with dimensions** sub-case specifically (e.g. one row per 
      ```bash
      STAGING=<branch> .venv/bin/etl indicator-upgrade auto
      ```
-   - **`auto` can detect nothing for a legitimate version bump** ("No dataset migrations detected. Nothing to do."). Don't conclude there's nothing to remap — fall back to an explicit mapping: pair old/new variable ids by `shortName` across the two dataset ids, store with `WizardDB.add_variable_mapping(...)`, preview with `cli_upgrade_indicators(dry_run=True)`, then apply (mechanics under "Indicator Upgrader CLI for one-shot chart remaps" in Guardrails). Map **all** indicators, not just charted ones — the full mapping is also what gives Anomalist's upgrade detectors complete coverage (see Final QA).
+   - **`auto` can detect nothing for a legitimate version bump** ("No dataset migrations detected. Nothing to do."). Don't conclude there's nothing to remap — fall back to an explicit mapping: pair old/new variable ids by `shortName` across the two dataset ids, store with `WizardDB.add_variable_mapping(...)`, preview with `cli_upgrade_indicators(dry_run=True)`, then apply (mechanics under "Indicator Upgrader CLI for one-shot chart remaps" in Guardrails). Map **all** indicators, not just charted ones — the full mapping is also what gives Anomalist's upgrade detectors complete coverage (see Final QA). The new-version shortNames left **unpaired** by this mapping are exactly the new-indicator list from step 5 — cross-check the two; a mismatch usually means a missed rename.
    - **CRITICAL**: After the upgrader finishes, always verify it actually worked by querying staging:
      ```bash
      mysql -h "staging-site-<branch>" -u owid --port 3306 -D owid -e "SELECT COUNT(*) FROM chart_dimensions cd JOIN variables v ON cd.variableId = v.id WHERE v.catalogPath LIKE '%<namespace>/<new_version>%'"
